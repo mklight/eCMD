@@ -41,6 +41,7 @@
 #include <fcntl.h>
 #include <sys/ioctl.h>
 #include <string.h>
+#include <time.h>
 
 #ifdef SERVER_PRINT_PERF
 #include <sys/time.h>
@@ -158,6 +159,36 @@ uint32_t system_iic_reset(Handle * i_handle, int i_type)
         return -1;
     } 
     return rc;
+}
+
+static int do_nanosleep(struct timespec & requested)
+{
+    struct timespec remaining;
+    int sleep_rc = 0;
+    do
+    {
+        errno = 0;
+        sleep_rc = nanosleep(&requested, &remaining);
+        requested = remaining;
+    } while ((sleep_rc != 0) && (errno == EINTR));
+
+    return sleep_rc;
+}
+
+static int local_sleep(long sec)
+{
+    struct timespec requested;
+    requested.tv_sec = sec;
+    requested.tv_nsec = 0;
+    return do_nanosleep(requested);
+}
+
+static int local_usleep(long usec)
+{
+    struct timespec requested;
+    requested.tv_sec = 0;
+    requested.tv_nsec = usec * 1000;
+    return do_nanosleep(requested);
 }
 
 uint32_t ServerI2CInstruction::iic_open(Handle ** handle, InstructionStatus & o_status)
@@ -563,106 +594,141 @@ ssize_t ServerI2CInstruction::iic_read(Handle * i_handle, ecmdDataBufferBase & o
         system_iic * handle = (system_iic *) i_handle;
         uint32_t bytes = length % 8 ? (length / 8) + 1 : length / 8;
 
-        uint32_t messages = 0;
-        // check if we need to write address to the bus before the write
-        if (handle->offset_width > 0)
+        if (handle->slave_address == 0x20)
         {
-            messages = 1;
-        }
-        
-        const uint32_t msgMax = (i2cFlags & INSTRUCTION_I2C_FLAG_MSG_SIZE_MASK) == 0 ? 8192 : ((i2cFlags & INSTRUCTION_I2C_FLAG_MSG_SIZE_MASK) >> INSTRUCITON_I2C_FLAG_MSG_SIZE_SHIFT);
-        messages += (bytes / (msgMax)) + ((bytes % msgMax) > 0 ? 1 : 0);
-
-        i2c_rdwr_ioctl_data * rdwr_data = new i2c_rdwr_ioctl_data;
-        rdwr_data->msgs = new i2c_msg[messages];
-        rdwr_data->nmsgs = messages;
-
-        uint32_t msg_offset = 0;
-
-        if (messages > 1)
-        {
-            // set up write message
-            rdwr_data->msgs[msg_offset].addr = handle->slave_address;
-            rdwr_data->msgs[msg_offset].flags = 0;
-            rdwr_data->msgs[msg_offset].len = handle->offset_width;
-            rdwr_data->msgs[msg_offset].buf = new uint8_t[rdwr_data->msgs[msg_offset].len];
-            // copy in offset data in bytes
-            for (uint8_t buf_offset = 0; buf_offset < handle->offset_width; buf_offset++)
+            if (handle->offset_width > 0)
             {
-                rdwr_data->msgs[msg_offset].buf[buf_offset] =
-                    (handle->offset >> ((handle->offset_width - buf_offset - 1) * 8)) & 0xFF;
-            }
-
-            msg_offset++;
-        }
-
-        // set up read message
-        for( uint32_t idx=0; (msgMax*idx) < bytes && msg_offset < messages; idx++ )
-        {
-            // set up read message
-            rdwr_data->msgs[msg_offset].addr = handle->slave_address;
-            rdwr_data->msgs[msg_offset].flags = I2C_M_RD;
-            uint32_t tmpbytes = ((msgMax*(idx+1)) > bytes) ? bytes - (msgMax*idx) : msgMax;
-            rdwr_data->msgs[msg_offset].len = tmpbytes;
-            rdwr_data->msgs[msg_offset].buf = new uint8_t[tmpbytes];
-
-            msg_offset++;
-        }
-
-        if (flags & INSTRUCTION_FLAG_SERVER_DEBUG)
-        {
-            snprintf(errstr, 200, "SERVER_DEBUG : rc = ioctl( handle->fd, I2C_RDWR, rdwr_data)\n");
-            o_status.errorMessage.append(errstr);
-            for( uint32_t msgidx=0; msgidx < messages; msgidx++)
-            {
-                snprintf(errstr, 200, "SERVER_DEBUG : rdwr_data[%d] - addr(0x%X) flag(%X) bytes(%d) buf...\n", msgidx, rdwr_data->msgs[msgidx].addr, rdwr_data->msgs[msgidx].flags, rdwr_data->msgs[msgidx].len);
-                o_status.errorMessage.append(errstr);
-            }
-        }
-        int32_t rc = 0;
-#ifdef TESTING
-        TESTPRINT("rc = ioctl(handle->fd, I2C_RDWR, rdwr_data);\n");
-#else
-        rc = ioctl(handle->fd, I2C_RDWR, rdwr_data);
-#endif
-
-        if (flags & INSTRUCTION_FLAG_SERVER_DEBUG)
-        {
-            snprintf(errstr, 200, "SERVER_DEBUG : rc = %d, errno = %d\n", rc, errno);
-            o_status.errorMessage.append(errstr);
-        }
-
-        if (rc >= 0)
-        {
-            rc = 0;
-            uint32_t byteidx = 0;
-            for ( msg_offset = 0; msg_offset < messages; msg_offset++ )
-            {
-                if ( rdwr_data->msgs[msg_offset].flags != 0 )
+                // write out command
+                for (uint8_t buf_offset = 0; buf_offset < handle->offset_width; buf_offset++)
                 {
-                    // copy out data
-                    uint32_t tmplength = ((msgMax*(byteidx+1)) < bytes) ? msgMax*8 : length - (msgMax*byteidx*8);
-                    o_data.insert(rdwr_data->msgs[msg_offset].buf, (byteidx*msgMax*8), tmplength);
-
-                    rc += tmplength % 8 ? (tmplength / 8) + 1 : tmplength / 8;
-                    byteidx++;
+                    uint8_t buf = (handle->offset >> ((handle->offset_width - buf_offset - 1) * 8)) & 0xFF;
+                    if (write(handle->fd, &buf, 1) != 1)
+                    {
+                        // ERROR
+                        return -1;
+                    }
+                    // FIXME delay
+                    local_usleep(10);
                 }
             }
-            rc = bytes;
+            // read data back
+            for (uint32_t buf_offset = 0; buf_offset < bytes; buf_offset++)
+            {
+                uint8_t buf = 0;
+                if (read(handle->fd, &buf, 1) != 1)
+                {
+                    // ERROR
+                    return -1;
+                }
+                o_data.insert(&buf, buf_offset, 1);
+                // FIXME delay
+                local_usleep(10);
+            }
+            return bytes;
         }
         else
         {
-            //perror("i2c read");
-        }
+            uint32_t messages = 0;
+            // check if we need to write address to the bus before the write
+            if (handle->offset_width > 0)
+            {
+                messages = 1;
+            }
 
-        for (msg_offset = 0; msg_offset < messages; msg_offset++)
-        {
-            delete [] rdwr_data->msgs[msg_offset].buf;
-        }
-        delete [] rdwr_data->msgs;
-        delete rdwr_data;
+            const uint32_t msgMax = (i2cFlags & INSTRUCTION_I2C_FLAG_MSG_SIZE_MASK) == 0 ? 8192 : ((i2cFlags & INSTRUCTION_I2C_FLAG_MSG_SIZE_MASK) >> INSTRUCITON_I2C_FLAG_MSG_SIZE_SHIFT);
+            messages += (bytes / (msgMax)) + ((bytes % msgMax) > 0 ? 1 : 0);
 
-        return rc;
+            i2c_rdwr_ioctl_data * rdwr_data = new i2c_rdwr_ioctl_data;
+            rdwr_data->msgs = new i2c_msg[messages];
+            rdwr_data->nmsgs = messages;
+
+            uint32_t msg_offset = 0;
+
+            if (messages > 1)
+            {
+                // set up write message
+                rdwr_data->msgs[msg_offset].addr = handle->slave_address;
+                rdwr_data->msgs[msg_offset].flags = 0;
+                rdwr_data->msgs[msg_offset].len = handle->offset_width;
+                rdwr_data->msgs[msg_offset].buf = new uint8_t[rdwr_data->msgs[msg_offset].len];
+                // copy in offset data in bytes
+                for (uint8_t buf_offset = 0; buf_offset < handle->offset_width; buf_offset++)
+                {
+                    rdwr_data->msgs[msg_offset].buf[buf_offset] =
+                        (handle->offset >> ((handle->offset_width - buf_offset - 1) * 8)) & 0xFF;
+                }
+
+                msg_offset++;
+            }
+
+            // set up read message
+            for( uint32_t idx=0; (msgMax*idx) < bytes && msg_offset < messages; idx++ )
+            {
+                // set up read message
+                rdwr_data->msgs[msg_offset].addr = handle->slave_address;
+                rdwr_data->msgs[msg_offset].flags = I2C_M_RD;
+                uint32_t tmpbytes = ((msgMax*(idx+1)) > bytes) ? bytes - (msgMax*idx) : msgMax;
+                rdwr_data->msgs[msg_offset].len = tmpbytes;
+                rdwr_data->msgs[msg_offset].buf = new uint8_t[tmpbytes];
+
+                msg_offset++;
+            }
+
+            if (flags & INSTRUCTION_FLAG_SERVER_DEBUG)
+            {
+                snprintf(errstr, 200, "SERVER_DEBUG : rc = ioctl( handle->fd, I2C_RDWR, rdwr_data)\n");
+                o_status.errorMessage.append(errstr);
+                for( uint32_t msgidx=0; msgidx < messages; msgidx++)
+                {
+                    snprintf(errstr, 200, "SERVER_DEBUG : rdwr_data[%d] - addr(0x%X) flag(%X) bytes(%d) buf...\n", msgidx, rdwr_data->msgs[msgidx].addr, rdwr_data->msgs[msgidx].flags, rdwr_data->msgs[msgidx].len);
+                    o_status.errorMessage.append(errstr);
+                }
+            }
+            int32_t rc = 0;
+#ifdef TESTING
+            TESTPRINT("rc = ioctl(handle->fd, I2C_RDWR, rdwr_data);\n");
+#else
+            rc = ioctl(handle->fd, I2C_RDWR, rdwr_data);
+#endif
+
+            if (flags & INSTRUCTION_FLAG_SERVER_DEBUG)
+            {
+                snprintf(errstr, 200, "SERVER_DEBUG : rc = %d, errno = %d\n", rc, errno);
+                o_status.errorMessage.append(errstr);
+            }
+
+            if (rc >= 0)
+            {
+                rc = 0;
+                uint32_t byteidx = 0;
+                for ( msg_offset = 0; msg_offset < messages; msg_offset++ )
+                {
+                    if ( rdwr_data->msgs[msg_offset].flags != 0 )
+                    {
+                        // copy out data
+                        uint32_t tmplength = ((msgMax*(byteidx+1)) < bytes) ? msgMax*8 : length - (msgMax*byteidx*8);
+                        o_data.insert(rdwr_data->msgs[msg_offset].buf, (byteidx*msgMax*8), tmplength);
+
+                        rc += tmplength % 8 ? (tmplength / 8) + 1 : tmplength / 8;
+                        byteidx++;
+                    }
+                }
+                rc = bytes;
+            }
+            else
+            {
+                //perror("i2c read");
+            }
+
+            for (msg_offset = 0; msg_offset < messages; msg_offset++)
+            {
+                delete [] rdwr_data->msgs[msg_offset].buf;
+            }
+            delete [] rdwr_data->msgs;
+            delete rdwr_data;
+
+            return rc;
+        }
     }
 }
 
@@ -704,64 +770,100 @@ ssize_t ServerI2CInstruction::iic_write(Handle * i_handle, InstructionStatus & o
         system_iic * handle = (system_iic *) i_handle;
         uint32_t bytes = length % 8 ? (length / 8) + 1 : length / 8;
 
-        uint32_t messages = 1;
-
-        i2c_rdwr_ioctl_data * rdwr_data = new i2c_rdwr_ioctl_data;
-        rdwr_data->msgs = new i2c_msg[messages];
-        rdwr_data->nmsgs = messages;
-
-        uint32_t msg_offset = 0;
-
-        // set up write message
-        rdwr_data->msgs[msg_offset].addr = handle->slave_address;
-        rdwr_data->msgs[msg_offset].flags = 0;
-        rdwr_data->msgs[msg_offset].len = handle->offset_width + bytes;
-        rdwr_data->msgs[msg_offset].buf = new uint8_t[rdwr_data->msgs[msg_offset].len];
-        // copy in offset data in bytes
-        for (uint8_t buf_offset = 0; buf_offset < handle->offset_width; buf_offset++)
+        if (handle->slave_address == 0x20)
         {
-            rdwr_data->msgs[msg_offset].buf[buf_offset] =
-                (handle->offset >> ((handle->offset_width - buf_offset - 1) * 8)) & 0xFF;
-        }
-        // copy in message data
-        data.extract(rdwr_data->msgs[msg_offset].buf + handle->offset_width, 0, length);
-
-        if (flags & INSTRUCTION_FLAG_SERVER_DEBUG)
-        {
-            snprintf(errstr, 200, "SERVER_DEBUG : rc = ioctl( handle->fd, I2C_RDWR, rdwr_data)\n");
-            o_status.errorMessage.append(errstr);
-            for( uint32_t idx=0; idx < messages; idx++)
+            if (handle->offset_width > 0)
             {
-                snprintf(errstr, 200, "SERVER_DEBUG : rdwr_data[%d] - addr(0x%X) flag(%X) bytes(%d) buf...\n", idx, rdwr_data->msgs[idx].addr, rdwr_data->msgs[idx].flags, rdwr_data->msgs[idx].len);
-                o_status.errorMessage.append(errstr);
+                // write out command
+                for (uint8_t buf_offset = 0; buf_offset < handle->offset_width; buf_offset++)
+                {
+                    uint8_t buf = (handle->offset >> ((handle->offset_width - buf_offset - 1) * 8)) & 0xFF;
+                    if (write(handle->fd, &buf, 1) != 1)
+                    {
+                        // ERROR
+                        return -1;
+                    }
+                    // FIXME delay
+                    local_usleep(10);
+                }
             }
+            // write out data
+            for (uint32_t buf_offset = 0; buf_offset < bytes; buf_offset++)
+            {
+                uint8_t buf = data.getByte(buf_offset);
+                if (write(handle->fd, &buf, 1) != 1)
+                {
+                    // ERROR
+                    return -1;
+                }
+                // FIXME delay
+                local_usleep(10);
+                if (((buf_offset % 128) == 0) && (buf_offset != 0))
+                    local_sleep(2);
+            }
+            return bytes;
         }
-        int32_t rc = 0;
+        else
+        {
+            uint32_t messages = 1;
+
+            i2c_rdwr_ioctl_data * rdwr_data = new i2c_rdwr_ioctl_data;
+            rdwr_data->msgs = new i2c_msg[messages];
+            rdwr_data->nmsgs = messages;
+
+            uint32_t msg_offset = 0;
+
+            // set up write message
+            rdwr_data->msgs[msg_offset].addr = handle->slave_address;
+            rdwr_data->msgs[msg_offset].flags = 0;
+            rdwr_data->msgs[msg_offset].len = handle->offset_width + bytes;
+            rdwr_data->msgs[msg_offset].buf = new uint8_t[rdwr_data->msgs[msg_offset].len];
+            // copy in offset data in bytes
+            for (uint8_t buf_offset = 0; buf_offset < handle->offset_width; buf_offset++)
+            {
+                rdwr_data->msgs[msg_offset].buf[buf_offset] =
+                    (handle->offset >> ((handle->offset_width - buf_offset - 1) * 8)) & 0xFF;
+            }
+            // copy in message data
+            data.extract(rdwr_data->msgs[msg_offset].buf + handle->offset_width, 0, length);
+
+            if (flags & INSTRUCTION_FLAG_SERVER_DEBUG)
+            {
+                snprintf(errstr, 200, "SERVER_DEBUG : rc = ioctl( handle->fd, I2C_RDWR, rdwr_data)\n");
+                o_status.errorMessage.append(errstr);
+                for( uint32_t idx=0; idx < messages; idx++)
+                {
+                    snprintf(errstr, 200, "SERVER_DEBUG : rdwr_data[%d] - addr(0x%X) flag(%X) bytes(%d) buf...\n", idx, rdwr_data->msgs[idx].addr, rdwr_data->msgs[idx].flags, rdwr_data->msgs[idx].len);
+                    o_status.errorMessage.append(errstr);
+                }
+            }
+            int32_t rc = 0;
 #ifdef TESTING
-        TESTPRINT("rc = ioctl(handle->fd, I2C_RDWR, rdwr_data);\n");
+            TESTPRINT("rc = ioctl(handle->fd, I2C_RDWR, rdwr_data);\n");
 #else
-        rc = ioctl(handle->fd, I2C_RDWR, rdwr_data);
+            rc = ioctl(handle->fd, I2C_RDWR, rdwr_data);
 #endif
 
-        if (flags & INSTRUCTION_FLAG_SERVER_DEBUG)
-        {
-            snprintf(errstr, 200, "SERVER_DEBUG : rc = %d, errno = %d\n", rc, errno);
-            o_status.errorMessage.append(errstr);
-        }
+            if (flags & INSTRUCTION_FLAG_SERVER_DEBUG)
+            {
+                snprintf(errstr, 200, "SERVER_DEBUG : rc = %d, errno = %d\n", rc, errno);
+                o_status.errorMessage.append(errstr);
+            }
 
-        if (rc >= 0)
-        {
-           rc = bytes;
-        }
+            if (rc >= 0)
+            {
+               rc = bytes;
+            }
 
-        for (msg_offset = 0; msg_offset < messages; msg_offset++)
-        {
-            delete [] rdwr_data->msgs[msg_offset].buf;
-        }
-        delete [] rdwr_data->msgs;
-        delete rdwr_data;
+            for (msg_offset = 0; msg_offset < messages; msg_offset++)
+            {
+                delete [] rdwr_data->msgs[msg_offset].buf;
+            }
+            delete [] rdwr_data->msgs;
+            delete rdwr_data;
 
-        return rc;
+            return rc;
+        }
     } 
 }
 
